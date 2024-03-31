@@ -179,16 +179,17 @@ func (c *client) ReadPump(
 			break
 		}
 
-		// handle the message
+		// handle the message so each message is processed serially (though note
+		// that handlers are called concurrently)
 		var wg sync.WaitGroup
 		wg.Add(len(handlers))
 		for _, h := range handlers {
 			go func(h func([]byte)) {
 				h(payload)
-				wg.Add(1)
+				wg.Done()
 			}(h)
 		}
-		wg.Done()
+		wg.Wait()
 	}
 }
 
