@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 
@@ -32,16 +33,22 @@ type Client interface {
 	io.Writer
 	io.Closer
 
-	// WritePump is responsible for writing messages to the client (including
+	// WriteForever is responsible for writing messages to the client (including
 	// the regularly spaced ping messages)
-	WritePump(func(Client), time.Duration)
+	WriteForever(context.Context, func(Client), time.Duration)
 
-	// ReadPump is responsible for reading messages from the client, and passing
+	// ReadForever is responsible for reading messages from the client, and passing
 	// them to the message handlers
-	ReadPump(func(Client), ...func([]byte))
+	ReadForever(context.Context, func(Client), ...func([]byte))
 
-	// Log allows consumers to inject their own logging dependencies
+	// SetLogger allows consumers to inject their own logging dependencies
+	SetLogger(any) error
+
+	// Log allows implementors to use their own logging dependencies
 	Log(int, string, ...any)
+
+	// Wait blocks until the client is done processing messages
+	Wait()
 }
 
 // ServeWS upgrades HTTP connections to WebSocket, creates the Client, calls the
@@ -57,7 +64,7 @@ func ServeWS(
 	clientFactory func(*websocket.Conn) Client,
 	// onCreate is a function to call once the Client is created (e.g.,
 	// store it in a some collection on the service for later reference)
-	onCreate func(Client),
+	onCreate func(context.Context, context.CancelFunc, Client),
 	// onDestroy is a function to call after the WebSocket connection is closed
 	// (e.g., remove it from the collection on the service)
 	onDestroy func(Client),
@@ -74,19 +81,23 @@ func ServeWS(
 		}
 		connSetup(conn)
 		client := clientFactory(conn)
-		onCreate(client)
+		ctx := context.Background()
+		ctx, cf := context.WithCancel(ctx)
+		onCreate(ctx, cf, client)
 
 		// all writes will happen in this goroutine, ensuring only one write on
 		// the connection at a time
-		go client.WritePump(onDestroy, ping)
+		go client.WriteForever(ctx, onDestroy, ping)
 
 		// all reads will happen in this goroutine, ensuring only one reader on
 		// the connection at a time
-		go client.ReadPump(onDestroy, msgHandlers...)
+		go client.ReadForever(ctx, onDestroy, msgHandlers...)
 	}
 }
 
 type client struct {
+	lock   *sync.RWMutex
+	wg     *sync.WaitGroup
 	conn   *websocket.Conn
 	egress chan []byte
 	logger *slog.Logger
@@ -96,6 +107,8 @@ type client struct {
 // ServeWS as the client factory arg.
 func NewClient(c *websocket.Conn) Client {
 	return &client{
+		lock:   &sync.RWMutex{},
+		wg:     &sync.WaitGroup{},
 		conn:   c,
 		egress: make(chan []byte, 32),
 		logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)),
@@ -116,20 +129,23 @@ func (c *client) Close() error {
 	return nil
 }
 
-// WritePump serially processes messages from the egress channel and writes them
+// WriteForever serially processes messages from the egress channel and writes them
 // to the client, ensuring that all writes to the underlying connection are
 // performed here.
-func (c *client) WritePump(onDestroy func(Client), ping time.Duration) {
-
-	// create a ticker that triggers a ping at given interval
+func (c *client) WriteForever(ctx context.Context, onDestroy func(Client), ping time.Duration) {
+	c.wg.Add(1)
 	pingTicker := time.NewTicker(ping)
 	defer func() {
+		c.wg.Done()
 		pingTicker.Stop()
 		onDestroy(c)
 	}()
 
 	for {
 		select {
+		case <-ctx.Done():
+			c.conn.WriteMessage(websocket.CloseMessage, nil)
+			return
 		case msgBytes, ok := <-c.egress:
 			// ok will be false in case the egress channel is closed
 			if !ok {
@@ -150,50 +166,74 @@ func (c *client) WritePump(onDestroy func(Client), ping time.Duration) {
 	}
 }
 
-// ReadPump serially processes messages from the client and passes them to the
+// ReadForever serially processes messages from the client and passes them to the
 // supplied message handlers in their own goroutine. Each message will be processed
 // serially, but the handlers are executed concurrently.
-func (c *client) ReadPump(
-	unregisterFunc func(Client),
-	handlers ...func([]byte),
-) {
-	// unregister and close before exit
+func (c *client) ReadForever(ctx context.Context, onDestroy func(Client), handlers ...func([]byte)) {
 	defer func() {
-		unregisterFunc(c)
+		c.wg.Done()
+		onDestroy(c)
 	}()
 
-	// read forever
-	for {
-		_, payload, err := c.conn.ReadMessage()
+	c.wg.Add(1)
+	ingress := make(chan []byte)
+	errCancel := make(chan error)
+	loop := true
 
-		if err != nil {
-			// client may have simply closed the connection
-			if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
-				c.Log(int(slog.LevelDebug), "client closed connection")
-				c.Close()
-				break
+	// read forever and push into ingress
+	go func() {
+		for {
+			_, payload, err := c.conn.ReadMessage()
+			if err != nil {
+				errCancel <- err
+				return
 			}
-			// unexpected error, close the connection
-			c.Log(int(slog.LevelError), fmt.Sprintf("error reading message: %v", err))
-			c.Close()
-			break
+			ingress <- payload
 		}
+	}()
 
-		// handle the message so each message is processed serially (though note
-		// that handlers are called concurrently)
-		var wg sync.WaitGroup
-		wg.Add(len(handlers))
-		for _, h := range handlers {
-			go func(h func([]byte)) {
-				h(payload)
-				wg.Done()
-			}(h)
+	// read while waiting for shutdown signals
+	for loop {
+		select {
+		case <-ctx.Done():
+			c.Log(0, "read loop cancelled, shutting down")
+			loop = false
+		case err := <-errCancel:
+			c.Log(0, "client connection closed in read loop")
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure, websocket.CloseNoStatusReceived) {
+				c.Log(0, "read loop encountered error, shutting down", "error", err.Error())
+			}
+			loop = false
+		case payload := <-ingress:
+			// handle the message so each message is processed serially (though note
+			// that handlers are called concurrently)
+			var wg sync.WaitGroup
+			wg.Add(len(handlers))
+			for _, h := range handlers {
+				go func(h func([]byte)) {
+					h(payload)
+					wg.Done()
+				}(h)
+			}
+			wg.Wait()
 		}
-		wg.Wait()
 	}
 }
 
+func (c *client) SetLogger(v any) error {
+	l, ok := v.(*slog.Logger)
+	if !ok {
+		return fmt.Errorf("bad logger value supplied")
+	}
+	c.logger = l
+	return nil
+}
+
 func (c *client) Log(level int, s string, args ...any) {
+	_, f, l, ok := runtime.Caller(1)
+	if ok {
+		args = append(args, "caller_source", fmt.Sprintf("%s %d", f, l))
+	}
 	switch level {
 	case int(slog.LevelDebug):
 		c.logger.Debug(s, args...)
@@ -206,30 +246,37 @@ func (c *client) Log(level int, s string, args ...any) {
 	}
 }
 
+// Done blocks until the read/write goroutines have completed
+func (c *client) Wait() {
+	c.wg.Wait()
+}
+
 // Manager maintains a set of Clients.
 type Manager interface {
 	Clients() []Client
-	RegisterClient(Client)
+	RegisterClient(context.Context, context.CancelFunc, Client)
 	UnregisterClient(Client)
 	Run(context.Context)
 }
 
 type manager struct {
 	mu         sync.RWMutex
-	clients    map[Client]struct{}
+	clients    map[Client]context.CancelFunc
 	register   chan regreq
 	unregister chan regreq
 }
 
 type regreq struct {
-	wp   Client
-	done chan struct{}
+	context context.Context
+	cancel  context.CancelFunc
+	client  Client
+	done    chan struct{}
 }
 
 func NewManager() Manager {
 	return &manager{
 		mu:         sync.RWMutex{},
-		clients:    make(map[Client]struct{}),
+		clients:    make(map[Client]context.CancelFunc),
 		register:   make(chan regreq),
 		unregister: make(chan regreq),
 	}
@@ -248,22 +295,24 @@ func (m *manager) Clients() []Client {
 }
 
 // RegisterClient adds the Client to the Manager's store.
-func (m *manager) RegisterClient(wp Client) {
+func (m *manager) RegisterClient(ctx context.Context, cf context.CancelFunc, c Client) {
 	done := make(chan struct{})
 	rr := regreq{
-		wp:   wp,
-		done: done,
+		context: ctx,
+		cancel:  cf,
+		client:  c,
+		done:    done,
 	}
 	m.register <- rr
 	<-done
 }
 
 // UnregisterClient removes the Client from the Manager's store.
-func (m *manager) UnregisterClient(wp Client) {
+func (m *manager) UnregisterClient(c Client) {
 	done := make(chan struct{})
 	rr := regreq{
-		wp:   wp,
-		done: done,
+		client: c,
+		done:   done,
 	}
 	m.unregister <- rr
 	<-done
@@ -273,34 +322,35 @@ func (m *manager) UnregisterClient(wp Client) {
 func (m *manager) Run(ctx context.Context) {
 	// helper fn for cleaning up client
 	cleanupClient := func(c Client) {
-		// delete from map
+		cancel, ok := m.clients[c]
+		if ok {
+			cancel()
+		}
 		delete(m.clients, c)
-		// close connections
 		c.Close()
 	}
 
 	for {
 		select {
-		case rr := <-m.register:
-			m.mu.Lock()
-			m.clients[rr.wp] = struct{}{}
-			m.mu.Unlock()
-			rr.done <- struct{}{}
-
-		case rr := <-m.unregister:
-			m.mu.Lock()
-			if _, ok := m.clients[rr.wp]; ok {
-				cleanupClient(rr.wp)
-			}
-			m.mu.Unlock()
-			rr.done <- struct{}{}
-
 		case <-ctx.Done():
 			m.mu.Lock()
 			for client := range m.clients {
 				cleanupClient(client)
 			}
 			m.mu.Unlock()
+		case rr := <-m.register:
+			m.mu.Lock()
+			m.clients[rr.client] = rr.cancel
+			m.mu.Unlock()
+			rr.done <- struct{}{}
+
+		case rr := <-m.unregister:
+			m.mu.Lock()
+			if _, ok := m.clients[rr.client]; ok {
+				cleanupClient(rr.client)
+			}
+			m.mu.Unlock()
+			rr.done <- struct{}{}
 		}
 	}
 }
@@ -314,7 +364,7 @@ type Broadcaster struct {
 func NewBroadcaster() Manager {
 	m := manager{
 		mu:         sync.RWMutex{},
-		clients:    make(map[Client]struct{}),
+		clients:    make(map[Client]context.CancelFunc),
 		register:   make(chan regreq),
 		unregister: make(chan regreq),
 	}

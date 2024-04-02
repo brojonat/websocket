@@ -14,9 +14,7 @@ import (
 )
 
 func TestWSHandler(t *testing.T) {
-
 	is := is.New(t)
-	ctx := context.Background()
 	testBytes := []byte("testing")
 
 	upgrader := gwebsocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
@@ -27,6 +25,11 @@ func TestWSHandler(t *testing.T) {
 	doneUnreg := make(chan websocket.Client)
 
 	var c websocket.Client
+	var cf context.CancelFunc
+
+	ctx := context.Background()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	manager := websocket.NewManager()
 	go manager.Run(ctx)
 
@@ -34,13 +37,15 @@ func TestWSHandler(t *testing.T) {
 		upgrader,
 		websocket.DefaultSetupConn,
 		websocket.NewClient,
-		func(_c websocket.Client) {
+		func(ctx context.Context, _cf context.CancelFunc, _c websocket.Client) {
+			cf = _cf
 			c = _c
-			manager.RegisterClient(c)
+			manager.RegisterClient(ctx, cf, c)
 			doneReg <- c
 		},
 		func(_c websocket.Client) {
 			manager.UnregisterClient(_c)
+			_c.Wait()
 			doneUnreg <- _c
 		},
 		50*time.Second,
@@ -49,13 +54,14 @@ func TestWSHandler(t *testing.T) {
 
 	// setup and connect to the the test server using a basic websocket
 	s := httptest.NewServer(h)
+
 	defer s.Close()
 	rawWS, _, err := gwebsocket.DefaultDialer.Dial(
 		"ws"+strings.TrimPrefix(s.URL, "http"), nil)
 	is.NoErr(err)
 	defer rawWS.Close()
 
-	// once unregistration is done, the manager should have one client
+	// once registration is done, the manager should have one client
 	<-doneReg
 	is.Equal(len(manager.Clients()), 1)
 
@@ -68,10 +74,10 @@ func TestWSHandler(t *testing.T) {
 
 	// close the connection, which should trigger the server to cleanup and
 	// unregister the client connection
-	closeWait := 5 * time.Millisecond
-	dl := time.Now().Add(closeWait)
-	rawWS.WriteControl(gwebsocket.CloseMessage, []byte("closing"), dl)
+	rawWS.WriteControl(gwebsocket.CloseMessage, nil, time.Now().Add(1*time.Second))
 	_p := <-doneUnreg
 	is.Equal(len(manager.Clients()), 0)
 	is.Equal(_p, c)
+	time.Sleep(1 * time.Second)
+	//FIXME: seems to be leaking goroutines
 }
