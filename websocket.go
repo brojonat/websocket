@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"time"
 
@@ -24,6 +25,14 @@ func DefaultSetupConn(c *websocket.Conn) {
 		c.SetReadDeadline(time.Now().Add(pw))
 		return nil
 	})
+}
+
+func DefaultUpgrader(origins []string) websocket.Upgrader {
+	upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+	upgrader.CheckOrigin = func(r *http.Request) bool {
+		return slices.Contains(origins, r.Header.Get("Origin"))
+	}
+	return upgrader
 }
 
 // Client is an interface for reading from and writing to a websocket
