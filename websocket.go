@@ -48,7 +48,7 @@ type Client interface {
 
 	// ReadForever is responsible for reading messages from the client, and passing
 	// them to the message handlers
-	ReadForever(context.Context, func(Client), ...func([]byte))
+	ReadForever(context.Context, func(Client), ...MessageHandler)
 
 	// SetLogger allows consumers to inject their own logging dependencies
 	SetLogger(any) error
@@ -59,6 +59,8 @@ type Client interface {
 	// Wait blocks until the client is done processing messages
 	Wait()
 }
+
+type MessageHandler func(Client, []byte)
 
 // ServeWS upgrades HTTP connections to WebSocket, creates the Client, calls the
 // onCreate callback, and starts goroutines that handle reading (writing)
@@ -80,7 +82,7 @@ func ServeWS(
 	// ping is the interval at which ping messages are aren't sent
 	ping time.Duration,
 	// msgHandlers are callbacks that handle messages received from the client
-	msgHandlers []func([]byte),
+	msgHandlers []MessageHandler,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -178,7 +180,7 @@ func (c *client) WriteForever(ctx context.Context, onDestroy func(Client), ping 
 // ReadForever serially processes messages from the client and passes them to the
 // supplied message handlers in their own goroutine. Each message will be processed
 // serially, but the handlers are executed concurrently.
-func (c *client) ReadForever(ctx context.Context, onDestroy func(Client), handlers ...func([]byte)) {
+func (c *client) ReadForever(ctx context.Context, onDestroy func(Client), handlers ...MessageHandler) {
 	defer func() {
 		c.wg.Done()
 		onDestroy(c)
@@ -219,8 +221,8 @@ func (c *client) ReadForever(ctx context.Context, onDestroy func(Client), handle
 			var wg sync.WaitGroup
 			wg.Add(len(handlers))
 			for _, h := range handlers {
-				go func(h func([]byte)) {
-					h(payload)
+				go func(h func(Client, []byte)) {
+					h(c, payload)
 					wg.Done()
 				}(h)
 			}

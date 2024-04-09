@@ -49,7 +49,7 @@ func TestWSHandler(t *testing.T) {
 			doneUnreg <- _c
 		},
 		50*time.Second,
-		[]func([]byte){func(b []byte) { c.Write(b) }},
+		[]websocket.MessageHandler{func(c websocket.Client, b []byte) { c.Write(b) }},
 	)
 
 	// setup and connect to the the test server using a basic websocket
