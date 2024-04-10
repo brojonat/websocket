@@ -98,6 +98,7 @@ func ServeWS(
 
 		// all writes will happen in this goroutine, ensuring only one write on
 		// the connection at a time
+
 		go client.WriteForever(ctx, onDestroy, ping)
 
 		// all reads will happen in this goroutine, ensuring only one reader on
@@ -117,9 +118,12 @@ type client struct {
 // NewClient returns a new Client from a *websocket.Conn. This can be passed to
 // ServeWS as the client factory arg.
 func NewClient(c *websocket.Conn) Client {
+	// add 2 to the wait group for the read/write goroutines
+	wg := &sync.WaitGroup{}
+	wg.Add(2)
 	return &client{
 		lock:   &sync.RWMutex{},
-		wg:     &sync.WaitGroup{},
+		wg:     wg,
 		conn:   c,
 		egress: make(chan []byte, 32),
 		logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)),
@@ -144,7 +148,6 @@ func (c *client) Close() error {
 // to the client, ensuring that all writes to the underlying connection are
 // performed here.
 func (c *client) WriteForever(ctx context.Context, onDestroy func(Client), ping time.Duration) {
-	c.wg.Add(1)
 	pingTicker := time.NewTicker(ping)
 	defer func() {
 		c.wg.Done()
@@ -186,7 +189,6 @@ func (c *client) ReadForever(ctx context.Context, onDestroy func(Client), handle
 		onDestroy(c)
 	}()
 
-	c.wg.Add(1)
 	ingress := make(chan []byte)
 	errCancel := make(chan error)
 	loop := true
